@@ -44,24 +44,38 @@ var (
 
 // ── CLI flags ────────────────────────────────────────────────────────────────
 
+// PublicRPCs is the default comparison set rendered alongside every run.
+// Every visitor sees how much slower the major free BSC RPCs are. Picks
+// three high-traffic public endpoints that don't require an API key.
+var PublicRPCs = []struct {
+	Label string
+	URL   string
+}{
+	{"binance dataseed",    "https://bsc-dataseed.binance.org"},
+	{"publicnode",          "https://bsc.publicnode.com"},
+	{"llamarpc",            "https://binance.llamarpc.com"},
+}
+
 type Config struct {
-	N          int
-	Concurrent int
-	Method     string
-	VsURL      string
-	JSON       bool
-	NoGeo      bool
-	Timeout    time.Duration
+	N            int
+	Concurrent   int
+	Method       string
+	VsURL        string
+	JSON         bool
+	NoGeo        bool
+	NoCompare    bool
+	Timeout      time.Duration
 }
 
 func parseFlags() Config {
 	c := Config{}
-	flag.IntVar(&c.N, "n", 1000, "number of RPC calls")
+	flag.IntVar(&c.N, "n", 1000, "number of RPC calls against StreamSuite")
 	flag.IntVar(&c.Concurrent, "c", 1, "concurrent in-flight requests (1 = serial)")
 	flag.StringVar(&c.Method, "method", "eth_blockNumber", "JSON-RPC method to call (read-only)")
 	flag.StringVar(&c.VsURL, "vs", "", "additional RPC URL to compare against, e.g. https://your-rpc/<KEY>")
 	flag.BoolVar(&c.JSON, "json", false, "emit a JSON result document instead of the human report")
 	flag.BoolVar(&c.NoGeo, "no-geo", false, "skip location detection")
+	flag.BoolVar(&c.NoCompare, "no-compare", false, "skip the default public-RPC comparison set")
 	flag.DurationVar(&c.Timeout, "timeout", 5*time.Second, "per-call timeout")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
@@ -417,8 +431,10 @@ type Report struct {
 	N           int                    `json:"n"`
 	Concurrent  int                    `json:"concurrent"`
 	StreamSuite RPCSection             `json:"streamsuite"`
-	Vs          *RPCSection            `json:"vs,omitempty"`
+	Vs          *RPCSection            `json:"vs,omitempty"`         // explicit --vs comparison
+	PublicCompare []PublicResult       `json:"public_compare,omitempty"` // default-on public RPC comparison
 	SLA         SLAVerdict             `json:"sla"`
+	Hints       []string               `json:"hints,omitempty"`
 	Meta        map[string]interface{} `json:"meta,omitempty"`
 }
 
@@ -429,67 +445,220 @@ type RPCSection struct {
 	RPCp50Ms    float64 `json:"rpc_p50_ms"`
 	RPCp99Ms    float64 `json:"rpc_p99_ms"`
 	RPCmaxMs    float64 `json:"rpc_max_ms"`
+	ServerP50Ms float64 `json:"server_p50_ms"`
 	ServerP99Ms float64 `json:"server_p99_ms"`
 	Throughput  float64 `json:"throughput_rps"`
 	Failed      int     `json:"failed"`
+}
+
+type PublicResult struct {
+	Label    string  `json:"label"`
+	URL      string  `json:"url"`
+	P50Ms    float64 `json:"p50_ms"`
+	P99Ms    float64 `json:"p99_ms"`
+	Failed   int     `json:"failed"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
 }
 
 type SLAVerdict struct {
 	TierTargetMs float64 `json:"tier_target_ms"`
 	ObservedMs   float64 `json:"observed_ms"`
 	Pass         bool    `json:"pass"`
+	Reason       string  `json:"reason,omitempty"`
 }
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
-// printReport renders a human report. The format is intentionally readable
-// when pasted into a Slack/Telegram channel.
+// Output is sized for a 72-column terminal so it stays readable when pasted
+// into Telegram, Slack, X, or a GitHub PR description.
+const RULE = "────────────────────────────────────────────────────────────────────"
+
+// printReport renders a human-readable, scope-clear, share-worthy report.
+//
+// Three sections in fixed order:
+//   1. YOUR network distance to our box (NOT our SLA)
+//   2. OUR server-side processing (the SLA boundary)
+//   3. TOTAL round-trip (what your bot actually feels)
+//
+// Followed by a default-on public-RPC comparison and an interpretation footer.
 func printReport(r Report) {
 	fmt.Println()
-	fmt.Printf("  streamsuite-bench %s\n", r.Version)
-	fmt.Printf("  detected location:  %s\n", r.Location)
-	fmt.Printf("  %d × %s  →  %s\n", r.N, r.Method, r.StreamSuite.URL)
-	fmt.Println()
-	fmt.Printf("  Network RTT  (TCP-SYN → :443):           %s\n", fmtMs(time.Duration(r.StreamSuite.NetTCPMs*float64(time.Millisecond))))
-	fmt.Printf("  Server proc  (RPC p99 − network):        %s\n", fmtMs(time.Duration(r.StreamSuite.ServerP99Ms*float64(time.Millisecond))))
-	fmt.Println("  ──────────────────────────────────────────────")
-	fmt.Printf("  Total RPC RTT (p99):                     %s\n", fmtMs(time.Duration(r.StreamSuite.RPCp99Ms*float64(time.Millisecond))))
-	fmt.Println()
-	verdict := "PASS"
-	if !r.SLA.Pass {
-		verdict = "MISS"
-	}
-	fmt.Printf("  Server SLA target (p99 ≤ %.0f ms): %s (%s)\n",
-		r.SLA.TierTargetMs, verdict, fmtMs(time.Duration(r.SLA.ObservedMs*float64(time.Millisecond))))
 
-	if r.Vs != nil {
+	// ── SLA SCOPE BANNER ── unmistakable from the first screenful
+	fmt.Println("  ╔══════════════════════════════════════════════════════════════════╗")
+	fmt.Println("  ║  SLA SCOPE — read this once                                      ║")
+	fmt.Println("  ║                                                                  ║")
+	fmt.Println("  ║  This tool reports TWO numbers separately:                       ║")
+	fmt.Println("  ║                                                                  ║")
+	fmt.Println("  ║    YOUR network distance to our Ashburn, VA node                 ║")
+	fmt.Println("  ║      → controlled by physics. NOT refund-eligible.               ║")
+	fmt.Println("  ║                                                                  ║")
+	fmt.Println("  ║    OUR server-side RPC processing latency                        ║")
+	fmt.Println("  ║      → THIS is what we SLA. p99 ≤ 5 ms or full refund.           ║")
+	fmt.Println("  ║                                                                  ║")
+	fmt.Println("  ║  Refund policy:  https://streamsuite.io/legal/refunds            ║")
+	fmt.Println("  ╚══════════════════════════════════════════════════════════════════╝")
+	fmt.Println()
+	fmt.Printf("  streamsuite-bench %s   detected location: %s\n", r.Version, r.Location)
+	fmt.Printf("  %d × %s  →  %s\n", r.N, r.Method, r.StreamSuite.URL)
+
+	// ── 1. YOUR network ──
+	fmt.Println()
+	fmt.Println("  ━━━ YOUR network distance (out of our control) ━━━━━━━━━━━━━━━━━")
+	fmt.Printf("  TCP-SYN handshake to :443 (p50):    %8s\n", fmtMs(time.Duration(r.StreamSuite.NetTCPMs*float64(time.Millisecond))))
+	fmt.Printf("  TLS setup (p50, includes handshake): %8s\n", fmtMs(time.Duration(r.StreamSuite.NetTLSMs*float64(time.Millisecond))))
+
+	// ── 2. OUR server ──
+	fmt.Println()
+	fmt.Println("  ━━━ OUR server-side processing  ◄── refund-eligible ────────────")
+	slaTarget := r.SLA.TierTargetMs
+	p50ok, p99ok := r.StreamSuite.ServerP50Ms <= slaTarget, r.StreamSuite.ServerP99Ms <= slaTarget
+	fmt.Printf("  Server p50:                         %8s   %s\n",
+		fmtMs(time.Duration(r.StreamSuite.ServerP50Ms*float64(time.Millisecond))), markSLA(p50ok, slaTarget))
+	fmt.Printf("  Server p99:                         %8s   %s\n",
+		fmtMs(time.Duration(r.StreamSuite.ServerP99Ms*float64(time.Millisecond))), markSLA(p99ok, slaTarget))
+
+	// ── 3. TOTAL ──
+	fmt.Println()
+	fmt.Println("  ━━━ TOTAL RPC round-trip (what your bot feels) ─────────────────")
+	fmt.Printf("  Total p50:                          %8s\n", fmtMs(time.Duration(r.StreamSuite.RPCp50Ms*float64(time.Millisecond))))
+	fmt.Printf("  Total p99:                          %8s\n", fmtMs(time.Duration(r.StreamSuite.RPCp99Ms*float64(time.Millisecond))))
+	fmt.Printf("  Throughput:                         %6.0f rps\n", r.StreamSuite.Throughput)
+	if r.StreamSuite.Failed > 0 {
+		fmt.Printf("  Failed calls:                       %8d   ⚠\n", r.StreamSuite.Failed)
+	}
+
+	// ── public RPC comparison ──
+	if len(r.PublicCompare) > 0 {
 		fmt.Println()
-		fmt.Println("  ─── comparison ─────────────────────────────────────────────")
-		fmt.Printf("  %-40s %8s %8s %8s\n", "endpoint", "p50", "p99", "max")
-		fmt.Printf("  %-40s %8s %8s %8s\n",
+		fmt.Println("  ━━━ vs. major public BSC RPCs ──────────────────────────────────")
+		fmt.Printf("  %-30s  %10s  %10s  %s\n", "endpoint", "p50", "p99", "vs streamsuite")
+		// streamsuite line first
+		fmt.Printf("  %-30s  %10s  %10s  %s\n",
 			"streamsuite (ashburn)",
 			fmtMs(time.Duration(r.StreamSuite.RPCp50Ms*float64(time.Millisecond))),
 			fmtMs(time.Duration(r.StreamSuite.RPCp99Ms*float64(time.Millisecond))),
-			fmtMs(time.Duration(r.StreamSuite.RPCmaxMs*float64(time.Millisecond))),
-		)
-		short := r.Vs.URL
-		if len(short) > 38 {
-			short = short[:35] + "…"
+			"⚡ baseline")
+		// public RPCs
+		fastest := 0.0
+		for _, pr := range r.PublicCompare {
+			if pr.SkippedReason != "" {
+				fmt.Printf("  %-30s  %10s  %10s  %s\n", pr.Label, "—", "—", "skipped: "+pr.SkippedReason)
+				continue
+			}
+			var verdict string
+			if r.StreamSuite.RPCp50Ms > 0 && pr.P50Ms > 0 {
+				ratio := pr.P50Ms / r.StreamSuite.RPCp50Ms
+				verdict = fmt.Sprintf("%.1f× slower", ratio)
+				if ratio > fastest {
+					fastest = ratio
+				}
+			}
+			fmt.Printf("  %-30s  %10s  %10s  %s\n", pr.Label,
+				fmtMs(time.Duration(pr.P50Ms*float64(time.Millisecond))),
+				fmtMs(time.Duration(pr.P99Ms*float64(time.Millisecond))),
+				verdict)
 		}
-		fmt.Printf("  %-40s %8s %8s %8s\n",
-			short,
-			fmtMs(time.Duration(r.Vs.RPCp50Ms*float64(time.Millisecond))),
-			fmtMs(time.Duration(r.Vs.RPCp99Ms*float64(time.Millisecond))),
-			fmtMs(time.Duration(r.Vs.RPCmaxMs*float64(time.Millisecond))),
-		)
-		if r.Vs.RPCp50Ms > 0 && r.StreamSuite.RPCp50Ms > 0 {
-			fmt.Printf("\n  Verdict: streamsuite is %.1f× faster at p50, %.1f× at p99.\n",
-				r.Vs.RPCp50Ms/r.StreamSuite.RPCp50Ms,
-				r.Vs.RPCp99Ms/r.StreamSuite.RPCp99Ms,
-			)
+		if fastest > 1 {
+			fmt.Printf("\n  ⚡ streamsuite is up to %.1f× faster than the major public BSC RPCs.\n", fastest)
 		}
 	}
+
+	// ── explicit --vs comparison ──
+	if r.Vs != nil {
+		fmt.Println()
+		fmt.Println("  ━━━ vs. your --vs endpoint ─────────────────────────────────────")
+		short := r.Vs.URL
+		if len(short) > 32 {
+			short = short[:29] + "…"
+		}
+		fmt.Printf("  %-30s  %10s  %10s\n", "your endpoint", "p50", "p99")
+		fmt.Printf("  %-30s  %10s  %10s\n", short,
+			fmtMs(time.Duration(r.Vs.RPCp50Ms*float64(time.Millisecond))),
+			fmtMs(time.Duration(r.Vs.RPCp99Ms*float64(time.Millisecond))))
+		if r.Vs.RPCp50Ms > 0 && r.StreamSuite.RPCp50Ms > 0 {
+			fmt.Printf("  → streamsuite is %.1f× faster at p50, %.1f× at p99.\n",
+				r.Vs.RPCp50Ms/r.StreamSuite.RPCp50Ms,
+				r.Vs.RPCp99Ms/r.StreamSuite.RPCp99Ms)
+		}
+	}
+
+	// ── verdict + interpretation ──
 	fmt.Println()
+	fmt.Println("  ━━━ verdict & interpretation ───────────────────────────────────")
+	if r.SLA.Pass {
+		fmt.Printf("  ✓ Server SLA PASS — p99 = %s, target ≤ %.0f ms.\n",
+			fmtMs(time.Duration(r.SLA.ObservedMs*float64(time.Millisecond))), r.SLA.TierTargetMs)
+	} else {
+		fmt.Printf("  ✗ Server SLA MISS — p99 = %s, target ≤ %.0f ms.\n",
+			fmtMs(time.Duration(r.SLA.ObservedMs*float64(time.Millisecond))), r.SLA.TierTargetMs)
+		if r.SLA.Reason != "" {
+			fmt.Printf("    reason: %s\n", r.SLA.Reason)
+		}
+	}
+	for _, h := range r.Hints {
+		fmt.Printf("  • %s\n", h)
+	}
+	fmt.Println()
+	fmt.Println("  Share or paste this output: https://streamsuite.io/bench")
+	fmt.Println()
+}
+
+func markSLA(ok bool, target float64) string {
+	if ok {
+		return fmt.Sprintf("✓ SLA target ≤ %.0f ms", target)
+	}
+	return fmt.Sprintf("✗ exceeds SLA target (≤ %.0f ms)", target)
+}
+
+// buildHints generates human interpretation messages tailored to the run's
+// numbers. These are the "why is it slow / what do I do about it" lines.
+func buildHints(r Report) []string {
+	var hints []string
+	ss := r.StreamSuite
+
+	// Connectivity failure
+	if ss.Failed > 0 {
+		hints = append(hints,
+			fmt.Sprintf("%d/%d calls failed. Check that outbound HTTPS to %s:443 is allowed by your firewall/proxy.",
+				ss.Failed, r.N, mustHost(ss.URL)))
+	}
+
+	// Network-distance hints
+	switch {
+	case ss.NetTCPMs >= 150:
+		hints = append(hints, fmt.Sprintf("Your network RTT to Ashburn is %s — you are likely in APAC/EU/SA. Physics dominates total latency; colocation is the only sub-10 ms path.", fmtMs(time.Duration(ss.NetTCPMs*float64(time.Millisecond)))))
+	case ss.NetTCPMs >= 50:
+		hints = append(hints, fmt.Sprintf("Your network RTT to Ashburn is %s — you are likely west-coast or mid-EU. Consider colocating your bot in us-east-1 / us-east-2.", fmtMs(time.Duration(ss.NetTCPMs*float64(time.Millisecond)))))
+	case ss.NetTCPMs >= 10 && ss.NetTCPMs < 50:
+		hints = append(hints, "Your network distance is good for North America. To get sub-2 ms total RTT, colocate in us-east-1 / us-east-2 (Reston / Ashburn).")
+	}
+
+	// TLS handshake noise (corporate-proxy / MITM signal)
+	if ss.NetTLSMs > 0 && ss.NetTCPMs > 0 && (ss.NetTLSMs-ss.NetTCPMs) > 30 {
+		hints = append(hints, fmt.Sprintf("TLS handshake takes %s longer than the raw TCP handshake. This often indicates a corporate proxy, aggressive firewall, or MITM appliance inspecting traffic.",
+			fmtMs(time.Duration((ss.NetTLSMs-ss.NetTCPMs)*float64(time.Millisecond)))))
+	}
+
+	// Server-side miss
+	if !r.SLA.Pass && ss.ServerP99Ms > r.SLA.TierTargetMs {
+		hints = append(hints, fmt.Sprintf("Server-side p99 exceeded the %0.0f ms SLA target. Re-run with --n 5000 for a more reliable sample. If still over, email support@streamsuite.io with the JSON (--json) — eligible for a refund per our policy.",
+			r.SLA.TierTargetMs))
+	}
+
+	// Public comparison context
+	hasFast := false
+	for _, p := range r.PublicCompare {
+		if p.SkippedReason == "" && p.P50Ms > 0 && p.P50Ms < ss.RPCp50Ms {
+			hasFast = true
+			break
+		}
+	}
+	if hasFast {
+		hints = append(hints, "A public RPC measured faster than us — unusual. Try --n 5000 for a more reliable sample.")
+	}
+
+	return hints
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -513,14 +682,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	serverP99 := ssStats.P99 - net.TCPMin
+	// Estimate one-way network time as half the cold TCP-SYN RTT — since the
+	// RPC over a warm keepalive socket is also ~1 RTT, subtracting one-way is
+	// the right unit. From the same box as the server this floors at 0 (the
+	// established-keepalive RPC is faster than a fresh TCP setup); from a real
+	// remote client, the signal is meaningful.
+	netOneWay := net.TCPMin / 2
+	serverP50 := ssStats.P50 - netOneWay
+	if serverP50 < 0 {
+		serverP50 = 0
+	}
+	serverP99 := ssStats.P99 - netOneWay
 	if serverP99 < 0 {
 		serverP99 = 0
 	}
+
 	// SLA verdict requires actual successful samples — a run with 100% failures
 	// can't pass just because the empty p99 happens to be ≤ target.
 	successRate := float64(ssStats.N-ssStats.Failed) / float64(ssStats.N)
 	slaPass := successRate >= 0.5 && serverP99 <= 5*time.Millisecond && ssStats.P99 > 0
+	slaReason := ""
+	switch {
+	case successRate < 0.5:
+		slaReason = fmt.Sprintf("only %.0f%% of calls succeeded — verdict requires ≥ 50%%", successRate*100)
+	case ssStats.P99 == 0:
+		slaReason = "no successful samples"
+	case serverP99 > 5*time.Millisecond:
+		slaReason = fmt.Sprintf("server p99 = %s exceeds 5 ms target", fmtMs(serverP99))
+	}
 
 	rep := Report{
 		Version:    Version,
@@ -536,6 +725,7 @@ func main() {
 			RPCp50Ms:    ms(ssStats.P50),
 			RPCp99Ms:    ms(ssStats.P99),
 			RPCmaxMs:    ms(ssStats.Max),
+			ServerP50Ms: ms(serverP50),
 			ServerP99Ms: ms(serverP99),
 			Throughput:  ssStats.Throughput,
 			Failed:      ssStats.Failed,
@@ -544,6 +734,7 @@ func main() {
 			TierTargetMs: 5,
 			ObservedMs:   ms(serverP99),
 			Pass:         slaPass,
+			Reason:       slaReason,
 		},
 	}
 	if ssStats.Failed > 0 {
@@ -553,6 +744,7 @@ func main() {
 		}
 	}
 
+	// Explicit single-URL comparison via --vs
 	if cfg.VsURL != "" {
 		vsStats, err := bench(ctx, cfg.VsURL, "", cfg.Method, cfg.N, cfg.Concurrent, cfg.Timeout)
 		if err == nil {
@@ -566,6 +758,30 @@ func main() {
 			}
 		}
 	}
+
+	// Default-on public-RPC comparison set. Smaller sample sizes per endpoint
+	// to keep total runtime bounded (public RPCs are slow + often rate-limit).
+	// Skip cleanly per-endpoint if one fails.
+	if !cfg.NoCompare {
+		for _, pub := range PublicRPCs {
+			pubStats, err := bench(ctx, pub.URL, "", cfg.Method, 50, 4, 3*time.Second)
+			pr := PublicResult{Label: pub.Label, URL: pub.URL}
+			if err != nil || pubStats.Failed >= 25 {
+				pr.SkippedReason = "endpoint unreachable or rate-limited"
+				if err != nil {
+					pr.SkippedReason = "error: " + err.Error()
+				}
+			} else {
+				pr.P50Ms = ms(pubStats.P50)
+				pr.P99Ms = ms(pubStats.P99)
+				pr.Failed = pubStats.Failed
+			}
+			rep.PublicCompare = append(rep.PublicCompare, pr)
+		}
+	}
+
+	// Generate interpretation hints based on the final numbers
+	rep.Hints = buildHints(rep)
 
 	if cfg.JSON {
 		_ = json.NewEncoder(os.Stdout).Encode(rep)
