@@ -28,9 +28,26 @@ builds:
       - -s -w -X main.Version={{.Version}}
 
 archives:
+  # Raw binary — what `curl | sh` installs from. One file, chmod +x, run.
   - id: raw
     formats: ['binary']
-    name_template: "streamsuite-bench-{{ .Os }}-{{ .Arch }}{{ if eq .Os \"windows\" }}.exe{{ end }}"
+    # GoReleaser auto-appends `.exe` on windows when format is `binary`, so
+    # the template must NOT include it — otherwise the asset ends up named
+    # ...windows-amd64.exe.exe (shipped briefly in v1.0.0).
+    name_template: "streamsuite-bench-{{ .Os }}-{{ .Arch }}"
+
+  # Compressed archive — what the "Download" buttons on streamsuite.io/bench
+  # link to. tar.gz on unix, zip on windows. Keeps file permissions and
+  # plays nicer with mainstream download UX / antivirus scanning.
+  - id: archive
+    formats: ['tar.gz']
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    name_template: "streamsuite-bench_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
 
 checksum:
   name_template: "checksums.txt"
