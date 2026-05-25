@@ -1,0 +1,10 @@
+# build artifacts
+/streamsuite-bench
+/streamsuite-bench-*
+/dist/
+
+# editor noise
+*.swp
+.DS_Store
+.idea/
+.vscode/
