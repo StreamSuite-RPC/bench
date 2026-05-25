@@ -12,21 +12,110 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: setup go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-
-      - name: goreleaser
-        uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: latest
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  smoke:
+    # Runs the real binary on a native runner for each target platform.
+    # Depends on goreleaser to publish assets first.
+    needs: goreleaser
+    name: smoke / ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-amd64
+            runner: ubuntu-latest
+            asset: streamsuite-bench-linux-amd64
+            shell: bash
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            asset: streamsuite-bench-linux-arm64
+            shell: bash
+          - label: darwin-arm64
+            runner: macos-latest
+            asset: streamsuite-bench-darwin-arm64
+            shell: bash
+          - label: darwin-amd64
+            runner: macos-13
+            asset: streamsuite-bench-darwin-amd64
+            shell: bash
+          - label: windows-amd64
+            runner: windows-latest
+            asset: streamsuite-bench-windows-amd64.exe
+            shell: pwsh
+    steps:
+      - name: download (unix)
+        if: matrix.shell != 'pwsh'
+        run: |
+          set -eu
+          url="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ matrix.asset }}"
+          echo "downloading $url"
+          curl -fsSL -o ./streamsuite-bench "$url"
+          chmod +x ./streamsuite-bench
+
+      - name: download (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ matrix.asset }}"
+          Write-Host "downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile ./streamsuite-bench.exe
+
+      - name: --version (unix)
+        if: matrix.shell != 'pwsh'
+        run: ./streamsuite-bench --version
+
+      - name: --version (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: .\streamsuite-bench.exe --version
+
+      - name: --help (unix)
+        if: matrix.shell != 'pwsh'
+        run: ./streamsuite-bench --help
+
+      - name: --help (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: .\streamsuite-bench.exe --help
+
+      - name: bench against streamsuite (unix)
+        if: matrix.shell != 'pwsh'
+        run: |
+          set -eu
+          ./streamsuite-bench --n 30 --no-geo --json > out.json
+          cat out.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("out.json"))
+          ss = d["streamsuite"]
+          assert ss["failed"] == 0, f"failed calls: {ss['failed']}"
+          assert ss["rpc_p99_ms"] > 0, f"p99 is zero — calls all dropped"
+          assert ss["rpc_p99_ms"] < 500, f"p99 absurdly high ({ss['rpc_p99_ms']} ms)"
+          print(f"OK: p50={ss['rpc_p50_ms']:.2f}ms p99={ss['rpc_p99_ms']:.2f}ms")
+          PY
+
+      - name: bench against streamsuite (windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          .\streamsuite-bench.exe --n 30 --no-geo --json | Tee-Object -FilePath out.json | Out-Host
+          $d = Get-Content out.json -Raw | ConvertFrom-Json
+          $ss = $d.streamsuite
+          if ($ss.failed -ne 0) { Write-Error "failed calls: $($ss.failed)"; exit 1 }
+          if ($ss.rpc_p99_ms -le 0) { Write-Error "p99 is zero"; exit 1 }
+          if ($ss.rpc_p99_ms -ge 500) { Write-Error "p99 absurdly high: $($ss.rpc_p99_ms) ms"; exit 1 }
+          Write-Host "OK: p50=$($ss.rpc_p50_ms)ms p99=$($ss.rpc_p99_ms)ms"
